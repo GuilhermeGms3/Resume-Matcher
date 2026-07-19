@@ -1,7 +1,13 @@
 """Unit tests for resume parsing helpers."""
 
 from app.schemas import ResumeData
-from app.services.parser import normalize_llm_resume_data, parse_resume_locally
+import pytest
+
+from app.services.parser import (
+    normalize_llm_resume_data,
+    parse_resume_locally,
+    validate_llm_resume_completeness,
+)
 
 
 def test_normalize_llm_resume_data_coerces_null_required_strings():
@@ -30,3 +36,21 @@ def test_parse_resume_locally_extracts_basic_resume_fields():
     assert data["personalInfo"]["email"] == "guilherme@example.com"
     assert data["personalInfo"]["title"] == "Infraestrutura"
     assert data["workExperience"][0]["description"] == ["Docker e Proxmox"]
+
+
+def test_validate_llm_resume_completeness_rejects_empty_structured_bullets():
+    parsed = {
+        "personalInfo": {"name": "Guilherme"},
+        "summary": "",
+        "workExperience": [],
+        "personalProjects": [],
+        "customSections": {
+            "skills": {
+                "sectionType": "itemList",
+                "items": [{"title": "Administrei Active Directory"}],
+            }
+        },
+    }
+
+    with pytest.raises(ValueError):
+        validate_llm_resume_completeness(parsed, "Guilherme\n- Administrei Active Directory")

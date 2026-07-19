@@ -161,6 +161,36 @@ def normalize_llm_resume_data(parsed_data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _has_resume_bullets(markdown_text: str) -> bool:
+    return any(
+        line.strip().startswith(("\u2022", "-", "*"))
+        for line in markdown_text.splitlines()
+    )
+
+
+def _has_structured_bullets(parsed_data: dict[str, Any]) -> bool:
+    for section in ("workExperience", "personalProjects"):
+        items = parsed_data.get(section)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("description"):
+                return True
+    return False
+
+
+def validate_llm_resume_completeness(
+    parsed_data: dict[str, Any],
+    markdown_text: str,
+) -> None:
+    """Reject technically-valid but unusable local-LLM parses."""
+    if markdown_text.strip() and not parsed_data.get("summary"):
+        raise ValueError("LLM parse omitted resume summary")
+
+    if _has_resume_bullets(markdown_text) and not _has_structured_bullets(parsed_data):
+        raise ValueError("LLM parse omitted structured resume bullets")
+
+
 async def parse_document(content: bytes, filename: str) -> str:
     """Convert PDF/DOCX to Markdown using markitdown.
 
@@ -213,10 +243,11 @@ async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
         prompt=prompt,
         system_prompt="You are a JSON extraction engine. Output only valid JSON, no explanations.",
         max_tokens=get_safe_max_tokens(model_name),
-        retries=3,
+        retries=0 if config.provider == "openai_compatible" else 3,
     )
 
     result = normalize_llm_resume_data(result)
+    validate_llm_resume_completeness(result, markdown_text)
 
     # Patch dates: restore months the LLM may have dropped
     result = restore_dates_from_markdown(result, markdown_text)
