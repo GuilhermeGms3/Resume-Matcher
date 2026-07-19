@@ -116,6 +116,51 @@ def restore_dates_from_markdown(
     return parsed_data
 
 
+def normalize_llm_resume_data(parsed_data: dict[str, Any]) -> dict[str, Any]:
+    """Coerce common local-LLM schema mistakes before Pydantic validation."""
+    data = dict(parsed_data)
+
+    personal = data.get("personalInfo")
+    if not isinstance(personal, dict):
+        personal = {}
+    for key in ("name", "title", "email", "phone", "location"):
+        if personal.get(key) is None:
+            personal[key] = ""
+    data["personalInfo"] = personal
+
+    for section, string_fields, list_fields in (
+        ("workExperience", ("title", "company", "years"), ("description",)),
+        ("education", ("institution", "degree", "years"), ()),
+        ("personalProjects", ("name", "role", "years"), ("description",)),
+    ):
+        items = data.get(section)
+        if items is None:
+            data[section] = []
+            continue
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("id", index)
+            for key in string_fields:
+                if item.get(key) is None:
+                    item[key] = ""
+            for key in list_fields:
+                if item.get(key) is None:
+                    item[key] = []
+
+    additional = data.get("additional")
+    if not isinstance(additional, dict):
+        additional = {}
+    for key in ("technicalSkills", "languages", "certificationsTraining", "awards"):
+        if additional.get(key) is None:
+            additional[key] = []
+    data["additional"] = additional
+
+    return data
+
+
 async def parse_document(content: bytes, filename: str) -> str:
     """Convert PDF/DOCX to Markdown using markitdown.
 
@@ -127,6 +172,9 @@ async def parse_document(content: bytes, filename: str) -> str:
         Markdown text content
     """
     suffix = Path(filename).suffix.lower()
+
+    if suffix in {".txt", ".md", ".json"}:
+        return content.decode("utf-8-sig", errors="replace")
 
     # Write to temp file for markitdown
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -168,9 +216,112 @@ async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
         retries=3,
     )
 
+    result = normalize_llm_resume_data(result)
+
     # Patch dates: restore months the LLM may have dropped
     result = restore_dates_from_markdown(result, markdown_text)
 
     # Validate against schema
     validated = ResumeData.model_validate(result)
     return validated.model_dump()
+
+
+def parse_resume_locally(markdown_text: str) -> dict[str, Any]:
+    """Build a basic structured resume without calling an LLM.
+
+    This is a reliability fallback for local models that fail to return valid
+    JSON. It keeps uploads usable; AI tailoring can still run later.
+    """
+    lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+    text = "\n".join(lines)
+
+    email_match = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", text)
+    phone_match = None
+    for line in lines[:20]:
+        if re.fullmatch(r"\d{4}\s*[-\u2013\u2014]\s*(?:\d{4}|Em andamento|Atual|Present)", line, re.IGNORECASE):
+            continue
+        candidate = re.search(r"(?:\+?\d[\d ().-]{7,}\d)", line)
+        if candidate and len(re.findall(r"\d", candidate.group(0))) >= 8:
+            phone_match = candidate
+            break
+
+    name_parts: list[str] = []
+    for line in lines[:8]:
+        if "@" in line or ":" in line or "/" in line:
+            continue
+        if re.search(r"\d", line):
+            continue
+        if len(line.split()) <= 4:
+            name_parts.append(line.title())
+        if len(" ".join(name_parts).split()) >= 2:
+            break
+
+    title = ""
+    for line in lines:
+        if line.lower().startswith(("area:", "area de atuacao:", "area de atuação:", "área:")):
+            title = line.split(":", 1)[1].strip()
+            break
+
+    location = ""
+    for line in lines[:15]:
+        if re.search(r"\b[A-Z]{2}\b", line) and "," in line:
+            location = line
+            break
+
+    skill_candidates: list[str] = []
+    for line in lines:
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        if any(
+            word in label.lower()
+            for word in ("skill", "compet", "ferrament", "infra", "rede", "observ", "autom")
+        ):
+            for item in re.split(r",|;|/|\u2022", value):
+                item = item.strip(" .")
+                if item and len(item) <= 40:
+                    skill_candidates.append(item)
+
+    seen: set[str] = set()
+    skills = []
+    for skill in skill_candidates:
+        key = skill.casefold()
+        if key not in seen:
+            seen.add(key)
+            skills.append(skill)
+
+    bullets = [
+        re.sub(r"^[\u2022\-*]\s*", "", line).strip()
+        for line in lines
+        if line.startswith(("\u2022", "-", "*"))
+    ]
+
+    fallback = ResumeData(
+        personalInfo={
+            "name": " ".join(name_parts),
+            "title": title,
+            "email": email_match.group(0) if email_match else "",
+            "phone": phone_match.group(0) if phone_match else "",
+            "location": location,
+        },
+        summary="\n".join(lines[:12])[:1200],
+        workExperience=[
+            {
+                "id": 1,
+                "title": title or "Experiencia profissional",
+                "company": "",
+                "years": "",
+                "description": bullets[:8],
+            }
+        ]
+        if bullets
+        else [],
+        additional={"technicalSkills": skills},
+        customSections={
+            "raw_resume_text": {
+                "sectionType": "text",
+                "text": markdown_text[:8000],
+            }
+        },
+    )
+    return fallback.model_dump()

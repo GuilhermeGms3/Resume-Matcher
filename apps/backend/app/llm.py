@@ -481,6 +481,8 @@ def _build_router(config: LLMConfig) -> Router:
     if api_base:
         litellm_params["api_base"] = api_base
 
+    local_no_auth_provider = config.provider in _PROVIDERS_WITHOUT_ENV_KEY_FALLBACK
+
     return Router(
         model_list=[
             {
@@ -488,14 +490,14 @@ def _build_router(config: LLMConfig) -> Router:
                 "litellm_params": litellm_params,
             }
         ],
-        num_retries=3,
+        num_retries=0 if local_no_auth_provider else 3,
         retry_policy=RetryPolicy(
             AuthenticationErrorRetries=0,
             BadRequestErrorRetries=0,
-            TimeoutErrorRetries=2,
-            RateLimitErrorRetries=3,
+            TimeoutErrorRetries=0 if local_no_auth_provider else 2,
+            RateLimitErrorRetries=0 if local_no_auth_provider else 3,
             ContentPolicyViolationErrorRetries=0,
-            InternalServerErrorRetries=2,
+            InternalServerErrorRetries=0 if local_no_auth_provider else 2,
         ),
         # Cooldowns disabled: with a single deployment and no fallback,
         # cooldowns would blackout the backend on transient failures.
@@ -718,6 +720,12 @@ def _supports_json_mode(model_name: str) -> bool:
     if model_name.startswith(("ollama/", "ollama_chat/")):
         return True
 
+    # OpenAI-compatible local servers such as LM Studio can reject the legacy
+    # {"type": "json_object"} response_format even though LiteLLM routes them
+    # through the OpenAI client. Prompt-only JSON is more compatible here.
+    if model_name.startswith("openai/"):
+        return False
+
     try:
         info = litellm.get_model_info(model=model_name)
         supported_params = info.get("supported_openai_params", [])
@@ -914,6 +922,7 @@ def _calculate_timeout(
     # Provider-specific latency adjustments
     provider_factors = {
         "openai": 1.0,
+        "openai_compatible": 0.17,
         "anthropic": 1.2,
         "openrouter": 1.5,  # More variable latency
         "groq": 1.0,

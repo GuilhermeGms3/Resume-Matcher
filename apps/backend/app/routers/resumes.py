@@ -41,7 +41,12 @@ from app.schemas import (
     UpdateTitleRequest,
     normalize_resume_data,
 )
-from app.services.parser import parse_document, parse_resume_to_json, restore_dates_from_markdown
+from app.services.parser import (
+    parse_document,
+    parse_resume_locally,
+    parse_resume_to_json,
+    restore_dates_from_markdown,
+)
 from app.services.improver import (
     MONTH_PATTERN,
     apply_diffs,
@@ -504,7 +509,12 @@ ALLOWED_TYPES = {
     "application/pdf",
     "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "text/markdown",
+    "application/json",
+    "application/octet-stream",
 }
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".json"}
 MAX_FILE_SIZE = 4 * 1024 * 1024  # 4MB
 
 
@@ -515,11 +525,18 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeUploadResponse:
     Converts the file to Markdown and stores it in the database.
     Optionally parses to structured JSON if LLM is configured.
     """
-    # Validate file type
-    if file.content_type not in ALLOWED_TYPES:
+    filename = file.filename or "resume"
+    suffix = Path(filename).suffix.lower()
+
+    # Validate file type. Some browsers/OSes upload text-like files as
+    # application/octet-stream, so allow by extension too.
+    if file.content_type not in ALLOWED_TYPES and suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type: {file.content_type}. Allowed: PDF, DOC, DOCX",
+            detail=(
+                f"Invalid file type: {file.content_type}. "
+                "Allowed: PDF, DOC, DOCX, TXT, MD, JSON"
+            ),
         )
 
     # Read and validate size
@@ -535,7 +552,7 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeUploadResponse:
 
     # Convert to markdown
     try:
-        markdown_content = await parse_document(content, file.filename or "resume.pdf")
+        markdown_content = await parse_document(content, filename)
     except Exception as e:
         logger.error(f"Document parsing failed: {e}")
         raise HTTPException(
@@ -575,10 +592,21 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeUploadResponse:
         resume["processed_data"] = processed_data
         resume["processing_status"] = "ready"
     except Exception as e:
-        # LLM parsing failed, update status to failed
-        logger.warning(f"Resume parsing to JSON failed for {file.filename}: {e}")
-        db.update_resume(resume["resume_id"], {"processing_status": "failed"})
-        resume["processing_status"] = "failed"
+        logger.warning(
+            "Resume LLM parsing failed for %s; using local fallback: %s",
+            file.filename,
+            e,
+        )
+        processed_data = parse_resume_locally(markdown_content)
+        db.update_resume(
+            resume["resume_id"],
+            {
+                "processed_data": processed_data,
+                "processing_status": "ready",
+            },
+        )
+        resume["processed_data"] = processed_data
+        resume["processing_status"] = "ready"
 
     # Return accurate status to client (API-001 fix)
     return ResumeUploadResponse(
@@ -1519,13 +1547,24 @@ async def retry_processing(resume_id: str) -> ResumeUploadResponse:
             is_master=resume.get("is_master", False),
         )
     except Exception as e:
-        logger.warning(f"Retry processing failed for resume {resume_id}: {e}")
-        db.update_resume(resume_id, {"processing_status": "failed"})
+        logger.warning(
+            "Retry LLM processing failed for resume %s; using local fallback: %s",
+            resume_id,
+            e,
+        )
+        processed_data = parse_resume_locally(markdown_content)
+        db.update_resume(
+            resume_id,
+            {
+                "processed_data": processed_data,
+                "processing_status": "ready",
+            },
+        )
         return ResumeUploadResponse(
-            message="Retry processing failed",
+            message="Resume processing used local fallback",
             request_id=str(uuid4()),
             resume_id=resume_id,
-            processing_status="failed",
+            processing_status="ready",
             is_master=resume.get("is_master", False),
         )
 

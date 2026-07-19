@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.llm import _appears_truncated, _get_retry_temperature, _supports_temperature
+from app.llm import (
+    _appears_truncated,
+    _get_retry_temperature,
+    _supports_json_mode,
+    _supports_temperature,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +79,14 @@ class TestSupportsTemperature:
         assert _supports_temperature("Anthropic/Claude-Opus-4-7", 0.7) is False
         assert _supports_temperature("OPENAI/KIMI-K2.6", 0.7) is False
         assert _supports_temperature("openai/KIMI-K2.6", 1.0) is True
+
+
+class TestSupportsJsonMode:
+    """Tests for _supports_json_mode()."""
+
+    def test_openai_compatible_uses_prompt_only_json(self):
+        """LM Studio/openai-compatible endpoints reject json_object frequently."""
+        assert _supports_json_mode("openai/gemma-3") is False
 
 
 # ---------------------------------------------------------------------------

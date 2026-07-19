@@ -171,3 +171,64 @@ class TestRetryProcessing:
         async with client:
             resp = await client.post("/api/v1/resumes/res-123/retry-processing")
         assert resp.status_code == 400
+
+    @patch("app.routers.resumes.parse_resume_to_json", new_callable=AsyncMock)
+    @patch("app.routers.resumes.db")
+    async def test_retry_uses_local_fallback_when_llm_fails(
+        self, mock_db, mock_parse, client, mock_resume_record
+    ):
+        failed_record = {
+            **mock_resume_record,
+            "content": "Jane Doe\njane@example.com\n- Built Python APIs",
+            "processing_status": "failed",
+            "processed_data": None,
+        }
+        mock_db.get_resume.return_value = failed_record
+        mock_parse.side_effect = TimeoutError("local model timed out")
+
+        async with client:
+            resp = await client.post("/api/v1/resumes/res-123/retry-processing")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["processing_status"] == "ready"
+        updated = mock_db.update_resume.call_args.args[1]
+        assert updated["processing_status"] == "ready"
+        assert updated["processed_data"]["personalInfo"]["email"] == "jane@example.com"
+
+
+class TestUploadResume:
+    """POST /api/v1/resumes/upload"""
+
+    @patch("app.routers.resumes.parse_resume_to_json", new_callable=AsyncMock)
+    @patch("app.routers.resumes.db")
+    async def test_upload_txt_uses_local_fallback_when_llm_fails(
+        self, mock_db, mock_parse, client
+    ):
+        mock_db.create_resume_atomic_master = AsyncMock(
+            return_value={
+                "resume_id": "res-456",
+                "content": "Jane Doe\njane@example.com\n- Built Python APIs",
+                "processing_status": "processing",
+                "is_master": True,
+            }
+        )
+        mock_parse.side_effect = TimeoutError("local model timed out")
+
+        async with client:
+            resp = await client.post(
+                "/api/v1/resumes/upload",
+                files={
+                    "file": (
+                        "resume.txt",
+                        b"Jane Doe\njane@example.com\n- Built Python APIs",
+                        "text/plain",
+                    )
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["processing_status"] == "ready"
+        updated = mock_db.update_resume.call_args.args[1]
+        assert updated["processed_data"]["personalInfo"]["email"] == "jane@example.com"
